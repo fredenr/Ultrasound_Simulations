@@ -90,14 +90,18 @@ kgrid = kWaveGrid(Nx, dx, Ny, dy);
 
 medium.sound_speed = c0 * ones(Nx, Ny);
 medium.density = rho0 * ones(Nx, Ny);
-medium.alpha_coeff = 0.35;     % [dB/(MHz^y cm)]
+medium.alpha_coeff = 0.75 * ones(Nx, Ny);     % [dB/(MHz^y cm)]
 medium.alpha_power = 1.5;
 
 % Build a compact phantom: one fast inclusion, one slow inclusion, one ring.
 [X, Y] = ndgrid(kgrid.x_vec, kgrid.y_vec);
 
 medium.sound_speed = sound_speed;
-%medium.density = density_kg_m3;
+
+load ct_density_attenuation_1.3.12.2.1107.5.1.4.83567.30000025112415592178200005306_192x192.mat;
+medium.density = density_kg_m3;
+medium.alpha_coeff = attenuation_coeff_db_mhz_cm;
+medium.alpha_power = alpha_power;
 
 phantom_mask = medium.sound_speed;
 phantom_mask(phantom_mask==1480.0) = 0.0;

@@ -83,7 +83,7 @@ directional_min_abs_cos = 0.0;  % set >0 to reject very grazing TX/RX pairs
 
 % Use measured RF data exported by UTA64_LEMO_AcquireRF_Planar_Abdomen_Array_64_Save_RFData.m.
 % Set use_measured_data = false to run synthetic k-Wave acquisition.
-use_measured_data = true;
+use_measured_data = false;
 measured_rf_file = 'C:\Users\Administrator\Documents\Vantage-4.9.6-2502061500\Example_Scripts\CustomScripts\measured_rf\UTA64_LEMO_RF_latest_FWI.mat';
 experimental_time_step_s = 4.1667e-07;  % experimental RF sample interval [s]
 measured_sample_rate_hz = 1 / experimental_time_step_s;
@@ -105,13 +105,17 @@ kgrid = kWaveGrid(Nx, dx, Ny, dy);
 
 medium.sound_speed = c0 * ones(Nx, Ny);
 medium.density = rho0 * ones(Nx, Ny);
-medium.alpha_coeff = 0.35;     % [dB/(MHz^y cm)]
+medium.alpha_coeff = 0.75;     % [dB/(MHz^y cm)]
 medium.alpha_power = 1.5;
 
 % Build a compact phantom: one fast inclusion, one slow inclusion, one ring.
 [X, Y] = ndgrid(kgrid.x_vec, kgrid.y_vec);
 medium.sound_speed = sound_speed;
-%medium.density = density_kg_m3;
+
+load ct_density_attenuation_1.3.12.2.1107.5.1.4.83567.30000025112415592178200005306_192x192.mat;
+medium.density = density_kg_m3;
+medium.alpha_coeff = attenuation_coeff_db_mhz_cm;
+medium.alpha_power = alpha_power;
 
 phantom_mask = medium.sound_speed;
 phantom_mask(phantom_mask==1480.0) = 0.0;
@@ -205,7 +209,7 @@ directional_ray_end_y = nan(num_elements, num_elements);
 directional_cos_tx = nan(num_elements, num_elements);
 directional_cos_rx = nan(num_elements, num_elements);
 min_separation = 3;       % ignore receivers too close along the contour
-threshold_fraction = 0.05;
+threshold_fraction = 0.15;
 
 for tx = 1:num_elements
     for rx = 1:num_elements
@@ -251,7 +255,7 @@ end
 time_shift = arrival_time - baseline_time;
 
 %% Full-waveform inversion reconstruction
-fwi_iterations = 3;
+fwi_iterations = 20;
 fwi_tx_list = 1:num_elements;    % use 1:num_elements for a slower, fuller inversion
 fwi_step = 18;                     % sound-speed update step [m/s] after normalisation
 c_min = 1350;
@@ -375,11 +379,11 @@ grid on;
 title('Example received waveform');
 xlabel('Time [\mus]'); ylabel('Pressure [Pa]');
 
-% nexttile;
-% plot(1:fwi_iterations, misfit_history, 'ko-', 'LineWidth', 1.2);
-% grid on;
-% title('FWI waveform misfit');
-% xlabel('Iteration'); ylabel('Normalised misfit');
+nexttile;
+plot(1:fwi_iterations, misfit_history, 'ko-', 'LineWidth', 1.2);
+grid on;
+title('FWI waveform misfit');
+xlabel('Iteration'); ylabel('Normalised misfit');
 
 nexttile;
 imagesc(kgrid.y_vec * 1e3, kgrid.x_vec * 1e3, c_recon);
