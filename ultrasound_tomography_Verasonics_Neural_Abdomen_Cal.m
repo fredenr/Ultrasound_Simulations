@@ -1,0 +1,1104 @@
+%% Ultrasound tomography simulation with k-Wave
+% This script simulates 2-D transmission ultrasound tomography using k-Wave.
+% It creates a heterogeneous sound-speed phantom, fires each element in a
+% contour-following array, estimates first-arrival time shifts, and reconstructs a
+% sound-speed field with a neural eikonal inverse model. Two networks fit
+% measured arrivals and the eikonal equation, allowing refracted propagation.
+% This is first-arrival tomography, not a full-wave scattering inversion.
+%
+% Requirements:
+%   - MATLAB
+%   - k-Wave toolbox on the MATLAB path: http://www.k-wave.org/
+%   - Deep Learning Toolbox (dlnetwork, dlarray, automatic differentiation)
+%   - neural_eikonal_tomography.m in this folder or on the MATLAB path
+%   - Signal Processing Toolbox for hilbert() is helpful, but a fallback
+%     envelope estimator is included.
+
+clear; close all; clc;
+
+addpath('C:\Users\natef\Projects\USCT\GPU\k-wave-toolbox-version-1.3\k-Wave\')
+
+if exist('kspaceFirstOrder2D', 'file') ~= 2
+    error('k-Wave was not found on the MATLAB path. Add it first, e.g. addpath(genpath(''C:\path\to\k-Wave''));');
+end
+if exist('dlnetwork', 'class') ~= 8 && exist('dlnetwork', 'file') ~= 2
+    error('Neural reconstruction requires MATLAB Deep Learning Toolbox.');
+end
+script_folder = fileparts(mfilename('fullpath'));
+addpath(script_folder);
+
+%% Neural reconstruction controls
+recon_N = 128;
+neural_options = struct( ...
+    'iterations', 8000, ...
+    'hidden_units', 128, ...
+    'hidden_layers', 4, ...
+    'batch_size', 512, ...
+    'collocation_points', 8192, ...
+    'physics_chunk_size', 1024, ...
+    'position_frequencies', [1 2 4 8 16], ...
+    'boundary_sample_fraction', 0.3, ...
+    'adaptive_sample_fraction', 0.25, ...
+    'learn_rate', 1e-3, ...
+    'min_sound_speed', 1000, ...
+    'max_sound_speed', 7000, ...
+    'physics_weight', 1, ...
+    'smoothness_weight', 0.001, ...
+    'background_weight', 1e-4, ...
+    'use_gpu', true, ...
+    'display_interval', 100, ...
+    'run_independent_validation', true, ...
+    'validation_max_pairs', 64, ...
+    'random_seed', 7);
+roi_padding_m = 8e-3;       % permit a near-boundary layer outside sensor centres
+reconstruction_margin_m = 15e-3;
+display_speed_limits = [1400 6400];
+show_arrival_diagnostics = true;
+% Optional matched water acquisition, with identical channel/clock settings.
+% An empty path keeps the geometric baseline; no reference is fabricated.
+water_reference_rf_file = 'C:\Users\natef\Projects\USCT\GPU\UTA64_LEMO_RF_latest_FWI_Uniform_Water.mat';
+water_reference_sound_speed_m_s = 1480.0; % set from reference-water temperature
+arrival_time_correction_s = 0; % known residual source/electronics delay only
+arrival_speed_bounds = [1350 6400];
+arrival_picker_options = struct('noise_sigma',6, 'relative_threshold',0.02, ...
+    'sustain_samples',2, 'noise_guard_s',4e-6, 'minimum_snr_db',10);
+reciprocity_tolerance_s = 6.7e-6;
+minimum_pair_confidence = 0.05;
+save_neural_results = true;
+neural_results_file = fullfile(script_folder, ...
+    'ultrasound_tomography_Abdomen_neural_results.mat');
+
+%% Simulation controls
+Nx = 350;                 % grid points in x
+Ny = 350;                 % grid points in y
+dx = 1.428567771429e-3;             % grid spacing [m]
+dy = dx;
+c0 = 1500;                % background sound speed [m/s]
+rho0 = 1000;              % density [kg/m^3]
+num_elements = 64;        % transducer count
+array_standoff = 0;       % outward offset from abdomen boundary [m]
+transducer_azimuth_deg = 0;   % CCW global rotation of all transducer positions [deg]
+transducer_rotation_center = [0, 0];  % [x, y] global rotation center [m]
+
+element_x = [96.981 96.981 96.981 96.981 94.981 94.721 92.530 88.765 ...
+    83.517 76.910 69.105 60.289 50.670 40.488 29.979 17.00 3.75 -8.183 -19.199 ...
+    -29.885 -40.080 -49.633 -58.401 -66.254 -73.075 -78.761 -83.228 -86.411 ...
+    -88.260 -87.981 -87.981 -87.981];
+element_x = [element_x, flip(element_x)] * 1e-3 - 4.5e-3;
+element_y = [-6.750 -20.000 -33.250 -46.500 -59.750 -70.916 -81.273 -91.167 ...
+    -100.361 -108.633 -115.785 -121.645 -126.072 -128.961 -130.241 -129.981 ...
+    -129.981 -128.078 -126.037 -122.668 -118.021 -112.167 -105.193 -97.202 ...
+    -88.313 -78.659 -68.385 -57.642 -46.592 -35.000 -21.280 -7.560];
+element_y = [element_y, flip(-element_y)] * 1e-3;
+
+% Optional per-transducer manual rotations. Use these when an individual
+% transducer axis does not pass through the phantom center. Angles are CCW
+% in degrees. Centers are [x, y] in metres for each transducer. Leave all
+% zeros to keep the current geometry.
+transducer_element_rotation_deg = [-4.086 -11.952 -19.388 -26.205 -32.866 -30.059 ...
+    -25.685 -21.305 -16.912 -12.534 -8.146 -3.756 9.523 5.025 9.414 6.365 0.551 ...
+    2.232 4.231 6.211 14.907 10.072 11.931 13.727 15.444 17.068 18.579 19.956 ...
+    21.174 21.148 13.235 4.776];
+transducer_element_rotation_deg = [transducer_element_rotation_deg, flip(-transducer_element_rotation_deg)];
+transducer_element_rotation_centers = [element_x', element_y'];
+% Example:
+% transducer_element_rotation_deg(7) = -3.5;
+% transducer_element_rotation_centers(7,:) = [0.012, -0.004];
+abdomen_mask_threshold = 1490; % sound-speed threshold used to find abdomen edge [m/s]
+source_freq = 0.300e6;     % source centre frequency [Hz]
+source_cycles = 1;        % tone burst length
+
+% Synthetic k-Wave transmitter model. A finite normal-velocity aperture is
+% used instead of a single isotropic pressure point when use_measured_data=false.
+piston_aperture_width_m = 9.906e-3;
+piston_velocity_scale = 1.0;
+
+% Direction-aware first-arrival timing. The baseline time and ray path use
+% effective points on the finite piston faces rather than element centres.
+use_directional_time_shifts = true;
+directional_time_shift_aperture_width_m = piston_aperture_width_m;
+directional_min_abs_cos = 0.0;  % set >0 to reject very grazing TX/RX pairs
+
+% Use measured RF data exported by UTA64_LEMO_AcquireRF_2D_Grid_Array_64_Line.m.
+% Set use_measured_data = false to run the original synthetic k-Wave acquisition.
+use_measured_data = true;
+measured_rf_file = 'C:\Users\natef\Projects\USCT\GPU\UTA64_LEMO_RF_latest_FWI_Water_1in_PLA_1in_Al.mat';
+experimental_time_step_s = 8.3333e-07;  % experimental RF sample interval [s]
+simulation_time_step_s = 4.1667e-07;  % experimental RF sample interval [s]
+
+if use_measured_data
+
+else
+    experimental_time_step_s = simulation_time_step_s;
+end
+
+measured_sample_rate_hz = 1 / experimental_time_step_s;
+measured_time_zero_s = 0;
+experimental_gate = 1:293;
+% Measured RF calibration from calibration_ratio_timeShift_*.mat.
+% Split pair gain C into 64 TX gains 1/t and residual pair gains C*t.
+% Their product preserves C without double scaling. Each trace is shifted by the
+% vs-sim time shift, polarity-corrected, then DC-offset corrected when present.
+use_rf_calibration = true;
+rf_calibration_file = fullfile('C:\Users\natef\Projects\USCT\GPU\calibration_ratio_timeShift_20261022_084519_952.mat'); % empty uses latest in script folder
+incident_rf_file = fullfile('C:\Users\natef\Projects\USCT\GPU\incident_rf_amplitudes.mat');
+
+ppw_min = c0 / source_freq / dx;
+
+fprintf('Points per wavelength at c0: %.2f\n', ppw_min);
+if ppw_min < 3
+    warning('The grid is coarse for this frequency. Lower source_freq or reduce dx for higher accuracy.');
+end
+
+%% Grid and time axis
+load ct_acoustic_fat_preserved_1.3.12.2.1107.5.1.4.83567.30000025112415592178200005366_192x192.mat;
+sound_speed(135:end,:) = 1480.0;
+
+kgrid = kWaveGrid(Nx, dx, Ny, dy);
+
+medium.sound_speed = c0 * ones(Nx, Ny);
+medium.density = rho0 * ones(Nx, Ny);
+medium.alpha_coeff = 0.75;     % [dB/(MHz^y cm)]
+medium.alpha_power = 1.5;
+
+% Build a compact phantom: one fast inclusion, one slow inclusion, one ring.
+[X, Y] = ndgrid(kgrid.x_vec, kgrid.y_vec);
+
+PLA_rod = hypot(X - 54.8034e-3, Y - 46.6606e-3) <= 12.7e-3;
+Al_rod = hypot(X + 61.4463e-3, Y + 58.6249e-3) <= 12.7e-3;
+
+medium.sound_speed(PLA_rod) = 2246.0;
+medium.sound_speed(Al_rod) = 6300.0;
+
+% [X_old,Y_old] = meshgrid(1:192,1:192);
+% [X_new,Y_new] = meshgrid(linspace(1,192,Nx),linspace(1,192,Ny));
+% 
+% sound_speed = interp2(X_old,Y_old,sound_speed,X_new,Y_new);
+% 
+% medium.sound_speed = single(sound_speed);
+% 
+% load ct_acoustic_fat_preserved_1.3.12.2.1107.5.1.4.83567.30000025112415592178200005366_192x192.mat;
+% density_kg_m3(135:end,:) = 1000.0;
+% 
+% density_kg_m3 = interp2(X_old,Y_old,density_kg_m3,X_new,Y_new);
+% 
+% 
+% medium.density = single(density_kg_m3);
+% attenuation_coeff_db_mhz_cm(135:end,:) = 0.0022;
+% 
+% attenuation_coeff_db_mhz_cm = interp2(X_old,Y_old,attenuation_coeff_db_mhz_cm,X_new,Y_new);
+% 
+% 
+% medium.alpha_coeff = single(attenuation_coeff_db_mhz_cm);
+% medium.alpha_power = single(alpha_power);
+
+%% Contour-following array coordinates
+% The transducer elements are sampled uniformly by arc length along the
+% outer edge of the abdomen phantom. Adjust abdomen_mask_threshold if the
+% loaded sound-speed map uses a different background value.
+
+% abdomen_mask = build_abdomen_mask(medium.sound_speed, abdomen_mask_threshold);
+% [boundary_i, boundary_j] = outer_boundary_ordered(abdomen_mask);
+% [element_i, element_j] = resample_closed_boundary(boundary_i, boundary_j, num_elements);
+%
+% if array_standoff ~= 0
+%     [element_i, element_j] = offset_boundary_points(kgrid, element_i, element_j, array_standoff);
+% end
+%
+% element_linear_index = sub2ind([Nx, Ny], element_i, element_j);
+% [~, unique_idx] = unique(element_linear_index, 'stable');
+% element_i = element_i(unique_idx);
+% element_j = element_j(unique_idx);
+% num_elements = numel(element_i);
+% element_x = kgrid.x_vec(element_i).';
+% element_y = kgrid.y_vec(element_j).';
+
+
+% Apply global and per-element rotations before snapping coordinates to the k-Wave grid.
+[element_x, element_y] = rotate_transducer_azimuth( ...
+    element_x, element_y, transducer_azimuth_deg, transducer_rotation_center);
+[element_x, element_y] = rotate_individual_transducers( ...
+    element_x, element_y, transducer_element_rotation_deg, transducer_element_rotation_centers);
+
+[element_i, element_j] = cart2grid_index(kgrid, element_x, element_y);
+element_x = kgrid.x_vec(element_i).';
+element_y = kgrid.y_vec(element_j).';
+[tx_normal_x, tx_normal_y] = compute_transducer_normals( ...
+    element_x, element_y, transducer_element_rotation_deg, ...
+    transducer_element_rotation_centers, transducer_rotation_center, min(dx, dy));
+
+cfl = 0.25;
+max_tx_rx_distance = max_pairwise_distance(element_x, element_y);
+valid_sound_speed = medium.sound_speed(isfinite(medium.sound_speed) & medium.sound_speed > 0);
+t_end = 1.35 * max_tx_rx_distance / min(valid_sound_speed(:));
+% Force the simulation time grid to match the experimental sampling interval.
+simulation_num_time = floor(t_end / experimental_time_step_s) + 1;
+kgrid.setTime(simulation_num_time, experimental_time_step_s);
+fprintf('Using shared simulation/experimental dt = %.4e s, Nt = %d\n', kgrid.dt, numel(kgrid.t_array));
+
+sensor.mask = [element_x; element_y];
+sensor.record = {'p'};
+
+source_signal = toneBurst(1 / kgrid.dt, source_freq, source_cycles);
+input_args = { ...
+    'PMLInside', false, ...
+    'PMLSize', 20, ...
+    'DataCast', 'single', ...
+    'PlotSim', false};
+
+%% Load measured RF data or simulate synthetic transmit events
+rf_calibration_meta = struct('enabled', false);
+if use_measured_data
+    fprintf('Loading measured Verasonics RF data from %s\n', measured_rf_file);
+    [pressure_data, data_t_array, rf_meta] = load_verasonics_rf_cube( ...
+        measured_rf_file, num_elements, measured_sample_rate_hz, measured_time_zero_s);
+    if any(experimental_gate < 1 | experimental_gate > size(pressure_data, 3)) || ...
+            any(diff(experimental_gate) ~= 1)
+        error('experimental_gate must be consecutive valid RF sample indices.');
+    end
+    pressure_data = pressure_data(:,:,experimental_gate);
+    data_t_array = data_t_array(experimental_gate);
+    num_time = size(pressure_data, 3);    
+    if use_rf_calibration
+        [pressure_data, rf_calibration_meta] = apply_rf_trace_calibration( ...
+            pressure_data, data_t_array, rf_calibration_file, incident_rf_file);
+        fprintf(['Applied TX/residual-pair RF calibration from %s: scaled %d (residual factors %d), ' ...
+            'shifted %d, polarity-corrected %d, DC-offset corrected %d traces.\n'], ...
+            rf_calibration_meta.source_file, rf_calibration_meta.num_scaled_traces, ...
+            rf_calibration_meta.num_receive_scaled_traces, ...
+            rf_calibration_meta.num_shifted_traces, rf_calibration_meta.num_polarity_flipped_traces, ...
+            rf_calibration_meta.num_dc_offset_corrected_traces);
+    else
+        rf_calibration_meta = struct('enabled', false);
+    end
+    fprintf('Loaded measured RF cube: %d tx x %d rx x %d samples, fs = %.3f MHz\n', ...
+        size(pressure_data, 1), size(pressure_data, 2), num_time, rf_meta.sample_rate_hz / 1e6);
+else
+    num_time = numel(kgrid.t_array);
+    data_t_array = measured_time_zero_s + (0:num_time-1) * experimental_time_step_s;
+    pressure_data = zeros(num_elements, num_elements, num_time, 'single');
+
+    fprintf('Running %d synthetic k-Wave transmit events...\n', num_elements);
+    for tx = 1:num_elements
+        source = build_piston_velocity_source( ...
+            kgrid, Nx, Ny, element_x(tx), element_y(tx), ...
+            tx_normal_x(tx), tx_normal_y(tx), piston_aperture_width_m, ...
+            piston_velocity_scale * source_signal);
+
+        sensor_data = kspaceFirstOrder2D(kgrid, medium, source, sensor, input_args{:});
+        pressure_data(tx, :, :) = single(sensor_data.p);
+        fprintf('  tx %02d/%02d complete\n', tx, num_elements);
+    end
+end
+
+%% Estimate first-arrival time shifts relative to a homogeneous background
+reference_pressure = [];
+reference_time = [];
+if ~isempty(water_reference_rf_file)
+    validateattributes(water_reference_sound_speed_m_s,{'numeric'},{'scalar','finite','positive'});
+    [reference_pressure, reference_time] = load_verasonics_rf_cube( ...
+        water_reference_rf_file, num_elements, measured_sample_rate_hz, measured_time_zero_s);
+    if use_rf_calibration
+        reference_pressure = apply_rf_trace_calibration(reference_pressure, reference_time, rf_calibration_file, incident_rf_file);
+    end
+end
+arrival_time = nan(num_elements, num_elements);
+raw_arrival_time = arrival_time;
+reference_arrival_time = arrival_time;
+pick_confidence = zeros(num_elements);
+pick_snr_db = arrival_time;
+pick_gate_edge = false(num_elements);
+pick_windows_s = nan(num_elements,num_elements,2);
+baseline_time = nan(num_elements, num_elements);
+ray_start_x = nan(num_elements, num_elements);
+ray_start_y = nan(num_elements, num_elements);
+ray_end_x = nan(num_elements, num_elements);
+ray_end_y = nan(num_elements, num_elements);
+directional_cos_tx = nan(num_elements, num_elements);
+directional_cos_rx = nan(num_elements, num_elements);
+min_separation = 3;       % ignore receivers too close along the contour
+data_dt = experimental_time_step_s;
+
+for tx = 1:num_elements
+    for rx = 1:num_elements
+        contour_gap = min(mod(rx - tx, num_elements), mod(tx - rx, num_elements));
+        if contour_gap < min_separation
+            continue;
+        end
+
+        trace = double(squeeze(pressure_data(tx, rx, :)));
+        if use_directional_time_shifts
+            [x1_eff, y1_eff, x2_eff, y2_eff, direct_distance, tx_cos, rx_cos] = directional_piston_ray( ...
+                element_x(tx), element_y(tx), tx_normal_x(tx), tx_normal_y(tx), ...
+                element_x(rx), element_y(rx), tx_normal_x(rx), tx_normal_y(rx), ...
+                directional_time_shift_aperture_width_m);
+        else
+            x1_eff = element_x(tx);
+            y1_eff = element_y(tx);
+            x2_eff = element_x(rx);
+            y2_eff = element_y(rx);
+            direct_distance = hypot(x2_eff - x1_eff, y2_eff - y1_eff);
+            tx_cos = 1;
+            rx_cos = 1;
+        end
+
+        if tx_cos < directional_min_abs_cos || rx_cos < directional_min_abs_cos
+            continue;
+        end
+
+        ray_start_x(tx, rx) = x1_eff;
+        ray_start_y(tx, rx) = y1_eff;
+        ray_end_x(tx, rx) = x2_eff;
+        ray_end_y(tx, rx) = y2_eff;
+        directional_cos_tx(tx, rx) = tx_cos;
+        directional_cos_rx(tx, rx) = rx_cos;
+        baseline_time(tx, rx) = direct_distance / c0;
+
+        window = [direct_distance/arrival_speed_bounds(2)-2*data_dt, ...
+            direct_distance/arrival_speed_bounds(1)+1/source_freq]+arrival_time_correction_s;
+        [picked, confidence, details] = pick_ultrasound_arrival( ...
+            trace, data_t_array, window, arrival_picker_options);
+        raw_arrival_time(tx,rx)=picked;
+        arrival_time(tx,rx)=picked-arrival_time_correction_s;
+        pick_confidence(tx,rx)=confidence;
+        pick_snr_db(tx,rx)=details.snr_db;
+        pick_gate_edge(tx,rx)=details.gate_edge;
+        pick_windows_s(tx,rx,:)=reshape(window,1,1,2);
+        if ~isempty(reference_pressure)
+            reference_trace=double(squeeze(reference_pressure(tx,rx,:)));
+            [reference_pick,reference_confidence]=pick_ultrasound_arrival( ...
+                reference_trace,reference_time,window,arrival_picker_options);
+            reference_arrival_time(tx,rx)=reference_pick-arrival_time_correction_s;
+            % Convert a reference-water delay to the reconstruction's c0.
+            baseline_time(tx,rx)=reference_arrival_time(tx,rx)- ...
+                direct_distance/water_reference_sound_speed_m_s+direct_distance/c0;
+            pick_confidence(tx,rx)=min(confidence,reference_confidence);
+        end
+    end
+end
+
+time_shift = arrival_time - baseline_time;
+raw_time_shift = time_shift;
+reciprocity_error_s = time_shift-time_shift.';
+paired=isfinite(reciprocity_error_s);
+reciprocity_weight=ones(num_elements);
+reciprocity_weight(paired)=exp(-0.5*(reciprocity_error_s(paired)/reciprocity_tolerance_s).^2);
+pair_weights=pick_confidence.*reciprocity_weight;
+pair_weights(pair_weights<minimum_pair_confidence | ~isfinite(time_shift))=0;
+time_shift(pair_weights==0)=NaN;
+fprintf('Accepted %d/%d picked pairs after confidence/reciprocity checks.\n', ...
+    nnz(pair_weights),nnz(isfinite(raw_time_shift)));
+
+%% Neural eikonal sound-speed reconstruction
+x_margin = max(2*dx,reconstruction_margin_m);
+y_margin = max(2*dy,reconstruction_margin_m);
+effective_x = [element_x(:); ray_start_x(isfinite(ray_start_x)); ray_end_x(isfinite(ray_end_x))];
+effective_y = [element_y(:); ray_start_y(isfinite(ray_start_y)); ray_end_y(isfinite(ray_end_y))];
+x_edges = linspace(min(effective_x) - x_margin, max(effective_x) + x_margin, recon_N + 1);
+y_edges = linspace(min(effective_y) - y_margin, max(effective_y) + y_margin, recon_N + 1);
+x_centres = 0.5 * (x_edges(1:end-1) + x_edges(2:end));
+y_centres = 0.5 * (y_edges(1:end-1) + y_edges(2:end));
+[XR, YR] = ndgrid(x_centres, y_centres);
+array_hull = convhull(element_x(:), element_y(:));
+recon_roi = inpolygon(XR, YR, element_x(array_hull), element_y(array_hull));
+% Expand geometrically, without using the CT image as a reconstruction prior.
+boundary_distance=inf(size(XR));
+for side=1:numel(array_hull)-1
+    a=array_hull(side); b=array_hull(side+1);
+    vx=element_x(b)-element_x(a); vy=element_y(b)-element_y(a);
+    fraction=min(1,max(0,((XR-element_x(a))*vx+(YR-element_y(a))*vy)/max(vx^2+vy^2,eps)));
+    boundary_distance=min(boundary_distance,hypot(XR-element_x(a)-fraction*vx,YR-element_y(a)-fraction*vy));
+end
+recon_roi=recon_roi | boundary_distance<=roi_padding_m;
+neural_options.arrival_tolerance_s = 3 * data_dt;
+neural_options.pair_weights=pair_weights;
+[c_recon, neural_result] = neural_eikonal_tomography( ...
+    time_shift, ray_start_x, ray_start_y, ray_end_x, ray_end_y, ...
+    x_centres, y_centres, recon_roi, c0, neural_options);
+% Export a full k-Wave-grid initializer for a subsequent FWI run.
+c_for_interpolation=c_recon;
+c_for_interpolation(~recon_roi)=c0;
+c_fwi_initial=single(interp2(y_centres,x_centres,c_for_interpolation,Y,X,'linear',c0));
+fwi_x_vec_m=kgrid.x_vec;
+fwi_y_vec_m=kgrid.y_vec;
+if save_neural_results
+    save(neural_results_file, 'c_recon', 'x_centres', 'y_centres', ...
+        'recon_roi', 'time_shift', 'arrival_time', 'baseline_time', ...
+        'element_x', 'element_y', 'neural_result', 'rf_calibration_meta', ...
+        'raw_time_shift', 'raw_arrival_time', 'reference_arrival_time', ...
+        'pair_weights', 'pick_confidence', 'pick_snr_db', 'pick_gate_edge', ...
+        'pick_windows_s', 'reciprocity_error_s', 'water_reference_rf_file', ...
+        'water_reference_sound_speed_m_s', 'data_t_array', ...
+        'arrival_picker_options', 'arrival_time_correction_s', ...
+        'roi_padding_m', 'c_fwi_initial', 'fwi_x_vec_m', 'fwi_y_vec_m', '-v7.3');
+    fprintf('Saved neural reconstruction to %s\n', neural_results_file);
+end
+
+%% Visualisation
+figure('Color', 'w', 'Name', 'k-Wave ultrasound tomography');
+tiledlayout(2, 2, 'Padding', 'compact', 'TileSpacing', 'compact');
+
+nexttile;
+imagesc(kgrid.y_vec * 1e3, kgrid.x_vec * 1e3, medium.sound_speed);
+axis image; colormap(gca, turbo); colorbar;
+caxis(display_speed_limits);
+title('True sound speed [m/s]');
+xlabel('y [mm]'); ylabel('x [mm]');
+hold on; plot(element_y * 1e3, element_x * 1e3, 'w.', 'MarkerSize', 8);
+
+nexttile;
+imagesc(1:num_elements, 1:num_elements, time_shift * 1e6);
+axis image; colorbar; colormap(gca, parula);
+title('Measured time shift [\mus]');
+xlabel('Receiver'); ylabel('Transmitter');
+
+nexttile;
+plot(data_t_array * 1e6, squeeze(pressure_data(32, 1, :)), 'k');
+grid on;
+title('Example received waveform');
+xlabel('Time [\mus]'); ylabel('Pressure [Pa]');
+
+nexttile;
+imagesc(-y_centres * 1e3, x_centres * 1e3, c_recon);
+axis image; colormap(gca, turbo); colorbar;
+title('Neural eikonal sound speed [m/s]');
+caxis(display_speed_limits);
+xlabel('y [mm]'); ylabel('x [mm]');
+
+fprintf('Done. Reconstruction range inside ROI: %.1f to %.1f m/s\n', ...
+    min(c_recon(recon_roi), [], 'omitnan'), max(c_recon(recon_roi), [], 'omitnan'));
+
+if show_arrival_diagnostics
+    figure('Color','w','Name','Neural tomography fit diagnostics');
+    tiledlayout(2,3,'Padding','compact','TileSpacing','compact');
+    nexttile; semilogy(neural_result.training_history(:,1:3)); grid on;
+    legend('Total','Arrival','Eikonal'); xlabel('Iteration'); title('Training losses');
+    nexttile; imagesc(pair_weights); axis image; colorbar; title('Pair confidence weights');
+    nexttile; imagesc(reciprocity_error_s*1e6); axis image; colorbar; title('Reciprocity difference [us]');
+    nexttile; imagesc((neural_result.predicted_time_shift_s-time_shift)*1e6);
+    axis image; colorbar; title('Neural arrival residual [us]');
+    if isfield(neural_result,'independent_validation')
+        independent=neural_result.independent_validation.predicted_time_shift_s;
+        nexttile; imagesc((independent-time_shift)*1e6);
+        axis image; colorbar; title('Speed-map arrival residual [us]');
+        nexttile; imagesc((independent-neural_result.predicted_time_shift_s)*1e6);
+        axis image; colorbar; title('Speed map vs neural times [us]');
+    end
+    figure('Color','w','Name','Inspect first-arrival picks');
+    tiledlayout(2,3,'Padding','compact','TileSpacing','compact');
+    candidates=find(isfinite(raw_arrival_time));
+    [~,order]=sort(abs(raw_time_shift(candidates)),'descend');
+    candidates=candidates(order(1:min(6,numel(order))));
+    for index=candidates(:).'
+        [tx,rx]=ind2sub(size(arrival_time),index);
+        nexttile; plot(data_t_array*1e6,squeeze(pressure_data(tx,rx,:)),'k'); hold on;
+        xline(raw_arrival_time(index)*1e6,'r-');
+        xline(pick_windows_s(tx,rx,1)*1e6,'b:'); xline(pick_windows_s(tx,rx,2)*1e6,'b:');
+        title(sprintf('TX %d RX %d, weight %.2f',tx,rx,pair_weights(index)));
+        xlabel('Time [us]'); grid on;
+    end
+end
+
+%% Local functions
+function mask = build_abdomen_mask(sound_speed, threshold)
+    mask = isfinite(sound_speed) & sound_speed > threshold;
+    mask = largest_component(mask);
+    mask = fill_mask_holes(mask);
+end
+
+function mask = largest_component(mask)
+    if exist('bwconncomp', 'file') == 2
+        cc = bwconncomp(mask);
+        if cc.NumObjects == 0
+            error('No abdomen mask pixels were found. Lower abdomen_mask_threshold.');
+        end
+        [~, largest] = max(cellfun(@numel, cc.PixelIdxList));
+        out = false(size(mask));
+        out(cc.PixelIdxList{largest}) = true;
+        mask = out;
+        return;
+    end
+
+    % Toolbox-free fallback: keep the mask as-is. The boundary extraction
+    % below will still work if the threshold leaves one dominant object.
+    if ~any(mask(:))
+        error('No abdomen mask pixels were found. Lower abdomen_mask_threshold.');
+    end
+end
+
+function mask = fill_mask_holes(mask)
+    if exist('imfill', 'file') == 2
+        mask = imfill(mask, 'holes');
+    end
+end
+
+function [boundary_i, boundary_j] = outer_boundary_ordered(mask)
+    if exist('bwboundaries', 'file') == 2
+        boundaries = bwboundaries(mask, 'noholes');
+        if isempty(boundaries)
+            error('No abdomen boundary points were found.');
+        end
+        [~, largest_boundary] = max(cellfun(@(b) size(b, 1), boundaries));
+        boundary = boundaries{largest_boundary};
+        boundary_i = boundary(:, 1);
+        boundary_j = boundary(:, 2);
+        return;
+    end
+
+    boundary = mask & (conv2(double(mask), ones(3), 'same') < 9);
+    [ii, jj] = find(boundary);
+    if isempty(ii)
+        error('No abdomen boundary points were found.');
+    end
+
+    centroid_i = mean(ii);
+    centroid_j = mean(jj);
+    angle = atan2(ii - centroid_i, jj - centroid_j);
+    [~, order] = sort(angle);
+    boundary_i = ii(order);
+    boundary_j = jj(order);
+end
+
+function [sample_i, sample_j] = resample_closed_boundary(boundary_i, boundary_j, num_samples)
+    points = [boundary_i(:), boundary_j(:)];
+    points(end + 1, :) = points(1, :);
+    segment_length = sqrt(sum(diff(points, 1, 1).^2, 2));
+    arc_length = [0; cumsum(segment_length)];
+
+    keep = [true; diff(arc_length) > 0];
+    points = points(keep, :);
+    arc_length = arc_length(keep);
+
+    sample_arc = linspace(0, arc_length(end), num_samples + 1).';
+    sample_arc(end) = [];
+    sample_i = round(interp1(arc_length, points(:, 1), sample_arc, 'linear'));
+    sample_j = round(interp1(arc_length, points(:, 2), sample_arc, 'linear'));
+end
+
+function [offset_i, offset_j] = offset_boundary_points(kgrid, element_i, element_j, standoff)
+    element_x = kgrid.x_vec(element_i).';
+    element_y = kgrid.y_vec(element_j).';
+    center_x = mean(element_x);
+    center_y = mean(element_y);
+    normal_x = element_x - center_x;
+    normal_y = element_y - center_y;
+    normal_length = hypot(normal_x, normal_y);
+    normal_x = normal_x ./ max(normal_length, eps);
+    normal_y = normal_y ./ max(normal_length, eps);
+
+    offset_x = element_x + standoff * normal_x;
+    offset_y = element_y + standoff * normal_y;
+    [offset_i, offset_j] = cart2grid_index(kgrid, offset_x, offset_y);
+end
+
+function distance = max_pairwise_distance(x, y)
+    distance = 0;
+    for n = 1:numel(x)
+        distance = max(distance, max(hypot(x(:) - x(n), y(:) - y(n))));
+    end
+end
+
+function roi = roi_from_mask(kgrid, mask, xq, yq)
+    ii = interp1(kgrid.x_vec, 1:numel(kgrid.x_vec), xq(:), 'nearest', 'extrap');
+    jj = interp1(kgrid.y_vec, 1:numel(kgrid.y_vec), yq(:), 'nearest', 'extrap');
+    roi = reshape(mask(sub2ind(size(mask), ii(:), jj(:))), size(xq));
+end
+
+function [ii, jj] = cart2grid_index(kgrid, x, y)
+    ii = zeros(size(x));
+    jj = zeros(size(y));
+    for n = 1:numel(x)
+        [~, ii(n)] = min(abs(kgrid.x_vec - x(n)));
+        [~, jj(n)] = min(abs(kgrid.y_vec - y(n)));
+    end
+end
+
+function [x1_eff, y1_eff, x2_eff, y2_eff, path_length, tx_cos, rx_cos] = directional_piston_ray( ...
+        tx_x, tx_y, tx_nx, tx_ny, rx_x, rx_y, rx_nx, rx_ny, aperture_width)
+    tx_nlen = max(hypot(tx_nx, tx_ny), eps);
+    rx_nlen = max(hypot(rx_nx, rx_ny), eps);
+    tx_nx = tx_nx / tx_nlen;
+    tx_ny = tx_ny / tx_nlen;
+    rx_nx = rx_nx / rx_nlen;
+    rx_ny = rx_ny / rx_nlen;
+
+    tx_tx = -tx_ny;
+    tx_ty = tx_nx;
+    rx_tx = -rx_ny;
+    rx_ty = rx_nx;
+
+    delta_x = tx_x - rx_x;
+    delta_y = tx_y - rx_y;
+    G = [tx_tx, -rx_tx; tx_ty, -rx_ty];
+    if abs(det(G)) > 1e-12
+        s = -G \ [delta_x; delta_y];
+        tx_offset = s(1);
+        rx_offset = s(2);
+    else
+        tx_offset = 0;
+        rx_offset = 0;
+    end
+
+    half_width = max(aperture_width, 0) / 2;
+    tx_offset = min(max(tx_offset, -half_width), half_width);
+    rx_offset = min(max(rx_offset, -half_width), half_width);
+
+    x1_eff = tx_x + tx_offset * tx_tx;
+    y1_eff = tx_y + tx_offset * tx_ty;
+    x2_eff = rx_x + rx_offset * rx_tx;
+    y2_eff = rx_y + rx_offset * rx_ty;
+
+    ray_x = x2_eff - x1_eff;
+    ray_y = y2_eff - y1_eff;
+    path_length = hypot(ray_x, ray_y);
+    if path_length <= eps
+        tx_cos = 0;
+        rx_cos = 0;
+        return;
+    end
+
+    ray_x = ray_x / path_length;
+    ray_y = ray_y / path_length;
+    tx_cos = abs(ray_x * tx_nx + ray_y * tx_ny);
+    rx_cos = abs(ray_x * rx_nx + ray_y * rx_ny);
+end
+
+function [pressure_data, meta] = apply_rf_trace_calibration(pressure_data, data_t_array, calibration_file, incident_file)
+    if nargin < 3 || isempty(calibration_file)
+        calibration_file = find_latest_calibration_file();
+    end
+    if ~isfile(calibration_file)
+        error('RF calibration file was not found: %s', calibration_file);
+    end
+
+    C = load(calibration_file);
+    if ~isfield(C, 'receive_amplitude_scaling_by_tx_rx')
+        error(['Calibration file %s must contain receive_amplitude_scaling_by_tx_rx ' ...
+            'for receive-only scaling. Regenerate it with ' ...
+            'calculateCalibrationRatiosAndTimeShifts.m.'], calibration_file);
+    end
+    if ~isfield(C, 'time_shift_by_tx_rx_s')
+        error('Calibration file %s is missing time_shift_by_tx_rx_s.', calibration_file);
+    end
+
+    receive_scale = double(C.receive_amplitude_scaling_by_tx_rx);
+    pair_size = [size(pressure_data, 1), size(pressure_data, 2)];
+    if ~isreal(receive_scale) || ~isequal(size(receive_scale), pair_size)
+        error('Receive amplitude scaling must be a real matrix matching RF cube TX/RX size [%d %d].', ...
+            pair_size(1), pair_size(2));
+    end
+    if nargin < 4 || isempty(incident_file)
+        incident_file = fullfile(fileparts(mfilename('fullpath')), 'incident_rf_amplitudes.mat');
+    end
+    [tx_strength, tx_fit] = fit_relative_transmitters(incident_file, pair_size);
+    transmit_scale = 1 ./ tx_strength; % 64 TX corrections, not 64-by-64 incident ratios
+    residual_pair_scale = bsxfun(@times, receive_scale, tx_strength);
+    amplitude_ratio = bsxfun(@times, residual_pair_scale, transmit_scale);
+    valid_amplitude_scaling = isfinite(receive_scale) & receive_scale > 0;
+    valid_amplitude_scaling(1:pair_size(1)+1:end) = false;
+    residual_pair_scale(~valid_amplitude_scaling) = NaN;
+    amplitude_ratio(~valid_amplitude_scaling) = NaN;
+    if any(~isfinite(amplitude_ratio(valid_amplitude_scaling))) || ...
+            any(abs(amplitude_ratio(valid_amplitude_scaling)./receive_scale(valid_amplitude_scaling)-1) > 1e-12)
+        error('TX/residual-pair decomposition did not preserve the original pair gain.');
+    end
+    time_shift_s = double(C.time_shift_by_tx_rx_s);
+    dc_offset = zeros(size(amplitude_ratio));
+    if isfield(C, 'dc_offset_by_tx_rx')
+        dc_offset = double(C.dc_offset_by_tx_rx);
+    end
+    polarity = ones(size(amplitude_ratio));
+    if isfield(C, 'polarity_by_tx_rx')
+        polarity = double(C.polarity_by_tx_rx);
+    elseif isfield(C, 'calibration_gain_by_tx_rx')
+        polarity = sign(double(C.calibration_gain_by_tx_rx));
+        polarity(polarity == 0 | ~isfinite(polarity)) = 1;
+    end
+    if ~isequal(size(amplitude_ratio), [size(pressure_data, 1), size(pressure_data, 2)])
+        error('Calibration amplitude ratio size [%s] does not match RF cube tx/rx size [%d %d].', ...
+            num2str(size(amplitude_ratio)), size(pressure_data, 1), size(pressure_data, 2));
+    end
+    if ~isequal(size(time_shift_s), [size(pressure_data, 1), size(pressure_data, 2)])
+        error('Calibration time-shift size [%s] does not match RF cube tx/rx size [%d %d].', ...
+            num2str(size(time_shift_s)), size(pressure_data, 1), size(pressure_data, 2));
+    end
+    if ~isequal(size(dc_offset), [size(pressure_data, 1), size(pressure_data, 2)])
+        error('Calibration DC offset size [%s] does not match RF cube tx/rx size [%d %d].', ...
+            num2str(size(dc_offset)), size(pressure_data, 1), size(pressure_data, 2));
+    end
+    if ~isequal(size(polarity), [size(pressure_data, 1), size(pressure_data, 2)])
+        error('Calibration polarity size [%s] does not match RF cube tx/rx size [%d %d].', ...
+            num2str(size(polarity)), size(pressure_data, 1), size(pressure_data, 2));
+    end
+
+    data_t_array = double(data_t_array(:)).';
+    num_tx = size(pressure_data, 1);
+    num_rx = size(pressure_data, 2);
+    num_scaled = 0;
+    num_shifted = 0;
+    num_polarity_flipped = 0;
+    num_dc_offset_corrected = 0;
+    calibrated_pairs = false(num_tx, num_rx);
+
+    for tx = 1:num_tx
+        for rx = 1:num_rx
+            scale = amplitude_ratio(tx, rx);
+            shift_s = time_shift_s(tx, rx);
+            offset = dc_offset(tx, rx);
+            pol = polarity(tx, rx);
+            if ~valid_amplitude_scaling(tx, rx)
+                scale = 1;
+            end
+            if ~isfinite(shift_s)
+                shift_s = 0;
+            end
+            if ~isfinite(offset)
+                offset = 0;
+            end
+            if ~isfinite(pol) || pol == 0
+                pol = 1;
+            else
+                pol = sign(pol);
+            end
+            if scale == 1 && shift_s == 0 && pol == 1 && offset == 0
+                continue;
+            end
+
+            trace = double(squeeze(pressure_data(tx, rx, :))).';
+            if shift_s ~= 0
+                trace = interp1(data_t_array, trace, data_t_array + shift_s, 'linear', 0);
+                num_shifted = num_shifted + 1;
+            end
+            if pol ~= 1
+                trace = pol .* trace;
+                num_polarity_flipped = num_polarity_flipped + 1;
+            end
+            if scale ~= 1
+                trace = scale .* trace;
+                num_scaled = num_scaled + 1;
+            end
+            if offset ~= 0
+                trace = trace + offset;
+                num_dc_offset_corrected = num_dc_offset_corrected + 1;
+            end
+            if isa(pressure_data, 'single')
+                pressure_data(tx, rx, :) = single(reshape(trace, 1, 1, []));
+            else
+                pressure_data(tx, rx, :) = reshape(trace, 1, 1, []);
+            end
+            calibrated_pairs(tx, rx) = true;
+        end
+    end
+
+    meta = struct();
+    meta.enabled = true;
+    meta.source_file = calibration_file;
+    meta.num_scaled_traces = num_scaled;
+    meta.num_receive_scaled_traces = nnz(valid_amplitude_scaling & residual_pair_scale ~= 1);
+    meta.num_transmit_scaled_traces = nnz(bsxfun(@and, valid_amplitude_scaling, transmit_scale ~= 1));
+    meta.num_valid_residual_pair_factors = nnz(valid_amplitude_scaling);
+    meta.amplitude_scaling_mode = 'relative_64_TX_plus_residual_pairs';
+    meta.relative_transmitter_strength = tx_strength;
+    meta.transmitter_normalization_gain = transmit_scale;
+    meta.residual_pair_amplitude_scaling_by_tx_rx = residual_pair_scale;
+    meta.transmitter_fit = tx_fit;
+    meta.transmit_scaling_applied = true;
+    meta.num_skipped_amplitude_pairs = nnz(~valid_amplitude_scaling);
+    meta.num_shifted_traces = num_shifted;
+    meta.num_polarity_flipped_traces = num_polarity_flipped;
+    meta.num_dc_offset_corrected_traces = num_dc_offset_corrected;
+    meta.calibrated_pairs = calibrated_pairs;
+    meta.receive_amplitude_scaling_by_tx_rx = receive_scale;
+    meta.combined_amplitude_scaling_by_tx_rx = amplitude_ratio;
+    meta.valid_amplitude_scaling_by_tx_rx = valid_amplitude_scaling;
+    meta.amplitude_ratio_sim_to_measured = receive_scale;
+    meta.time_shift_by_tx_rx_s = time_shift_s;
+    meta.dc_offset_by_tx_rx = dc_offset;
+    meta.polarity_by_tx_rx = polarity;
+end
+
+function [strength, info] = fit_relative_transmitters(incident_file, pair_size)
+    if ~isequal(pair_size, [64 64])
+        error('TX/residual-pair calibration expects RF data ordered as 64 TX x 64 RX x time.');
+    end
+    if ~isfile(incident_file)
+        error('Incident RF amplitude file not found: %s', incident_file);
+    end
+    S = load(incident_file, 'incident_peak_to_peak_by_tx_rx');
+    if ~isfield(S, 'incident_peak_to_peak_by_tx_rx') || ...
+            ~isnumeric(S.incident_peak_to_peak_by_tx_rx) || ...
+            ~isreal(S.incident_peak_to_peak_by_tx_rx) || ...
+            ~isequal(size(S.incident_peak_to_peak_by_tx_rx), pair_size)
+        error('Incident file must contain a real numeric 64-by-64 incident_peak_to_peak_by_tx_rx.');
+    end
+    amplitude = double(S.incident_peak_to_peak_by_tx_rx);
+    valid = isfinite(amplitude) & amplitude > 0;
+    valid(1:65:end) = false;
+    if any(sum(valid, 1) == 0) || any(sum(valid, 2) == 0)
+        error('Every TX and RX must have incident amplitude observations.');
+    end
+    % Dividing by a common p2p_amplitude_tx only shifts the RX intercepts;
+    % it cannot change the relative TX strengths with sum(log(TX)) = 0.
+    y = nan(pair_size);
+    y(valid) = log(amplitude(valid));
+    [tx, rx] = find(valid);
+    basis = null(ones(1, 64));
+    receivers = eye(64);
+    A = [basis(tx, :), receivers(rx, :)];
+    if rank(A) ~= 127
+        error('Incident pair graph is disconnected; relative calibration is not identifiable.');
+    end
+    alpha = zeros(64, 1);
+    beta = zeros(64, 1);
+    for iteration = 1:40
+        for i = 1:64
+            alpha(i) = median(y(i, valid(i, :)) - beta(valid(i, :)).');
+        end
+        for j = 1:64
+            beta(j) = median(y(valid(:, j), j) - alpha(valid(:, j)));
+        end
+    end
+    shift = mean(alpha);
+    alpha = alpha - shift;
+    beta = beta + shift;
+    coefficient = [basis.'*alpha; beta];
+    target = y(valid);
+    residual = target - A*coefficient;
+    sigma = max(1.4826*median(abs(residual-median(residual))), 1e-8);
+    delta = 1.345*sigma;
+    converged = false;
+    for iteration = 1:500
+        residual = target - A*coefficient;
+        weights = min(1, delta ./ max(abs(residual), realmin));
+        root_weights = sqrt(weights);
+        updated = bsxfun(@times, A, root_weights) \ (target .* root_weights);
+        change = max(abs(updated-coefficient));
+        coefficient = updated;
+        if change < 1e-10
+            converged = true;
+            break;
+        end
+    end
+    if ~converged
+        error('Robust incident-amplitude TX fit failed to converge.');
+    end
+    strength = exp(basis*coefficient(1:63));
+    if any(~isfinite(strength) | strength <= 0)
+        error('Robust TX fit produced invalid strengths.');
+    end
+    residual = target - A*coefficient;
+    weight_matrix = zeros(pair_size);
+    weight_matrix(valid) = min(1, delta ./ max(abs(residual), realmin));
+    info = struct('source_file', incident_file, 'method', 'log-space Huber IRLS', ...
+        'normalization', 'geometric mean TX strength = 1', ...
+        'num_pairs', nnz(valid), 'iterations', iteration, 'huber_scale_log', sigma, ...
+        'huber_threshold_log', delta, 'robust_weight_by_tx_rx', weight_matrix, ...
+        'median_multiplicative_error_factor', exp(median(abs(residual))), ...
+        'scope', 'Relative TX only; residual pair factors retain propagation and receiver/model effects');
+    fprintf('Robust TX fit: %d pairs, strengths %.3f to %.3f; geometric mean %.6f.\n', ...
+        nnz(valid), min(strength), max(strength), exp(mean(log(strength))));
+end
+
+function calibration_file = find_latest_calibration_file()
+    search_dir = fileparts(mfilename('fullpath'));
+    files = dir(fullfile(search_dir, 'calibration_ratio_timeShift_*.mat'));
+    if isempty(files)
+        error('No calibration_ratio_timeShift_*.mat file found in %s.', search_dir);
+    end
+    [~, idx] = max([files.datenum]);
+    calibration_file = fullfile(files(idx).folder, files(idx).name);
+end
+
+function [pressure_data, t_array, meta] = load_verasonics_rf_cube(file_name, num_elements, sample_rate_hz, time_zero_s)
+    if ~isfile(file_name)
+        error('Measured RF file was not found: %s', file_name);
+    end
+
+    S = load(file_name);
+    cube = [];
+    candidate_names = {'rf_data', 'rfCube', 'RFData', 'RData'};
+    for k = 1:numel(candidate_names)
+        name = candidate_names{k};
+        if isfield(S, name) && isnumeric(S.(name)) && ndims(S.(name)) == 3
+            cube = S.(name);
+            break;
+        end
+    end
+
+    if isempty(cube)
+        vars = fieldnames(S);
+        for k = 1:numel(vars)
+            value = S.(vars{k});
+            if isnumeric(value) && ndims(value) == 3
+                cube = value;
+                break;
+            end
+        end
+    end
+
+    if isempty(cube)
+        error('No 3-D numeric RF cube found in %s. Expected samples x rx x tx or tx x rx x samples.', file_name);
+    end
+
+    cube = single(cube);
+    sz = size(cube);
+    if sz(2) == num_elements && sz(3) == num_elements
+        pressure_data = permute(cube, [3, 2, 1]);       % samples x rx x tx -> tx x rx x samples
+    elseif sz(1) == num_elements && sz(2) == num_elements
+        pressure_data = cube;                           % tx x rx x samples
+    else
+        error('RF cube has size [%s], but expected samples x %d rx x %d tx or %d tx x %d rx x samples.', ...
+            num2str(sz), num_elements, num_elements, num_elements, num_elements);
+    end
+
+    if isempty(sample_rate_hz)
+        if isfield(S, 'sample_rate_hz')
+            sample_rate_hz = double(S.sample_rate_hz);
+        elseif isfield(S, 'sampleRateHz')
+            sample_rate_hz = double(S.sampleRateHz);
+        elseif isfield(S, 'fs')
+            sample_rate_hz = double(S.fs);
+        else
+            error('Sample rate not found in %s. Set measured_sample_rate_hz in the tomography script.', file_name);
+        end
+    end
+
+    num_samples = size(pressure_data, 3);
+    t_array = time_zero_s + (0:num_samples-1) / sample_rate_hz;
+    meta = struct('sample_rate_hz', sample_rate_hz, 'num_samples', num_samples, 'source_file', file_name);
+end
+
+function [x_rot, y_rot] = rotate_transducer_azimuth(x, y, azimuth_deg, center_xy)
+    if isempty(azimuth_deg)
+        azimuth_deg = 0;
+    end
+    if isempty(center_xy)
+        center_xy = [0, 0];
+    end
+    if numel(center_xy) ~= 2
+        error('transducer_rotation_center must be [x, y] in metres.');
+    end
+    if ~isscalar(azimuth_deg)
+        error('transducer_azimuth_deg must be a scalar array rotation angle in degrees.');
+    end
+
+    theta = deg2rad(azimuth_deg);
+    x0 = center_xy(1);
+    y0 = center_xy(2);
+    xr = x - x0;
+    yr = y - y0;
+    x_rot = x0 + xr * cos(theta) - yr * sin(theta);
+    y_rot = y0 + xr * sin(theta) + yr * cos(theta);
+end
+
+function [x_out, y_out] = rotate_individual_transducers(x, y, angle_deg, centers_xy)
+    num_elements = numel(x);
+    if isempty(angle_deg)
+        angle_deg = zeros(1, num_elements);
+    end
+    if isscalar(angle_deg)
+        angle_deg = repmat(angle_deg, 1, num_elements);
+    end
+    if numel(angle_deg) ~= num_elements
+        error('transducer_element_rotation_deg must be scalar or have one angle per transducer.');
+    end
+    if isempty(centers_xy)
+        centers_xy = zeros(num_elements, 2);
+    end
+    if isequal(size(centers_xy), [1, 2])
+        centers_xy = repmat(centers_xy, num_elements, 1);
+    end
+    if ~isequal(size(centers_xy), [num_elements, 2])
+        error('transducer_element_rotation_centers must be [1 x 2] or [num_elements x 2] in metres.');
+    end
+
+    x_out = x;
+    y_out = y;
+    for idx = 1:num_elements
+        if angle_deg(idx) == 0
+            continue;
+        end
+        theta = deg2rad(angle_deg(idx));
+        x0 = centers_xy(idx, 1);
+        y0 = centers_xy(idx, 2);
+        xr = x(idx) - x0;
+        yr = y(idx) - y0;
+        x_out(idx) = x0 + xr * cos(theta) - yr * sin(theta);
+        y_out(idx) = y0 + xr * sin(theta) + yr * cos(theta);
+    end
+end
+
+function source = build_piston_velocity_source(kgrid, Nx, Ny, x0, y0, normal_x, normal_y, aperture_width, source_signal)
+    normal_length = hypot(normal_x, normal_y);
+    if normal_length <= eps
+        error('Transducer normal vector has zero length. Check rotation centers and angles.');
+    end
+    normal_x = normal_x / normal_length;
+    normal_y = normal_y / normal_length;
+    tangent_x = -normal_y;
+    tangent_y = normal_x;
+
+    grid_step = min(abs(kgrid.x_vec(2) - kgrid.x_vec(1)), abs(kgrid.y_vec(2) - kgrid.y_vec(1)));
+    num_points = max(1, 2 * floor(max(aperture_width, grid_step) / grid_step / 2) + 1);
+    aperture_s = linspace(-aperture_width / 2, aperture_width / 2, num_points);
+    aperture_x = x0 + aperture_s * tangent_x;
+    aperture_y = y0 + aperture_s * tangent_y;
+    [aperture_i, aperture_j] = cart2grid_index(kgrid, aperture_x, aperture_y);
+    aperture_i = min(max(aperture_i, 1), Nx);
+    aperture_j = min(max(aperture_j, 1), Ny);
+    aperture_index = unique(sub2ind([Nx, Ny], aperture_i(:), aperture_j(:)), 'stable');
+
+    source = struct();
+    source.u_mask = zeros(Nx, Ny);
+    source.u_mask(aperture_index) = 1;
+    num_source_points = numel(aperture_index);
+    source.ux = repmat(normal_x * source_signal(:).', num_source_points, 1);
+    source.uy = repmat(normal_y * source_signal(:).', num_source_points, 1);
+end
+
+function [normal_x, normal_y] = compute_transducer_normals(x, y, angle_deg, centers_xy, fallback_center, center_tolerance)
+    if nargin < 6 || isempty(center_tolerance)
+        center_tolerance = eps;
+    end
+    num_elements = numel(x);
+    if isempty(angle_deg)
+        angle_deg = zeros(1, num_elements);
+    end
+    if isscalar(angle_deg)
+        angle_deg = repmat(angle_deg, 1, num_elements);
+    end
+    if numel(angle_deg) ~= num_elements
+        error('transducer_element_rotation_deg must be scalar or have one angle per transducer.');
+    end
+    if isempty(centers_xy)
+        centers_xy = repmat(fallback_center, num_elements, 1);
+    end
+    if isequal(size(centers_xy), [1, 2])
+        centers_xy = repmat(centers_xy, num_elements, 1);
+    end
+    if ~isequal(size(centers_xy), [num_elements, 2])
+        error('transducer_element_rotation_centers must be [1 x 2] or [num_elements x 2] in metres.');
+    end
+
+    normal_x = zeros(1, num_elements);
+    normal_y = zeros(1, num_elements);
+    for idx = 1:num_elements
+        vx = x(idx) - centers_xy(idx, 1);
+        vy = y(idx) - centers_xy(idx, 2);
+        if hypot(vx, vy) <= center_tolerance
+            vx = x(idx) - fallback_center(1);
+            vy = y(idx) - fallback_center(2);
+        end
+        if hypot(vx, vy) <= eps
+            vx = 1;
+            vy = 0;
+        end
+
+        theta = deg2rad(angle_deg(idx));
+        nx = vx * cos(theta) - vy * sin(theta);
+        ny = vx * sin(theta) + vy * cos(theta);
+        nlen = max(hypot(nx, ny), eps);
+        normal_x(idx) = nx / nlen;
+        normal_y(idx) = ny / nlen;
+    end
+end
